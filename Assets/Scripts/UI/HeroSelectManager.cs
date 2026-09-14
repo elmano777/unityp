@@ -1,19 +1,23 @@
 using System.Collections;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.Serialization;
 
 /// <summary>
 /// Drives the Hero Select screen.
 /// Each entry in <see cref="heroCards"/> is bound to the hero at the same index in
 /// <see cref="availableHeroes"/>. Clicking a card calls SelectHero(index): it previews the hero's
-/// 3D model on the pedestal, plays its voice line and reveals the CONFIRMAR button.
-/// ConfirmSelection() stores the hero in GameSession and loads the match scene.
+/// 3D model on the pedestal, plays its select voice line and reveals the CONFIRMAR button.
+/// ConfirmSelection() stores the hero in GameSession, fades to black, plays the hero's story intro
+/// (if any) and loads the match scene.
 /// Adding a hero = new HeroDefinitionSO + new card + new array entries.
 /// </summary>
 public class HeroSelectManager : MonoBehaviour
 {
     [SerializeField] private HeroDefinitionSO[] availableHeroes;
-    [SerializeField] private AudioSource entryAudioSource;
+    [Tooltip("2D source for the hero select voice line.")]
+    [FormerlySerializedAs("entryAudioSource")]
+    [SerializeField] private AudioSource voiceAudioSource;
     [SerializeField] private string nextSceneName = "SampleScene";
 
     [Header("UI")]
@@ -21,6 +25,10 @@ public class HeroSelectManager : MonoBehaviour
     [SerializeField] private HeroCardView[] heroCards;
     [SerializeField] private UnityEngine.UI.Button confirmButton;
     [SerializeField] private ScreenFader fader;
+    [Tooltip("Shows the hero's intro lines on the black screen after confirming. Optional.")]
+    [SerializeField] private IntroSequencePlayer introPlayer;
+    [Tooltip("Seconds to fade the select voice line out right before the scene loads (if still playing).")]
+    [SerializeField] private float voiceFadeOutDuration = 0.3f;
 
     [Header("3D Preview")]
     [Tooltip("Top-center of the pedestal; the model's feet are placed here. Its forward (+Z) should point at the player.")]
@@ -71,7 +79,7 @@ public class HeroSelectManager : MonoBehaviour
 
     /// <summary>
     /// Previews the hero at <paramref name="index"/>: shows its model on the pedestal,
-    /// plays its voice line, highlights its card and reveals the confirm button.
+    /// plays its select voice line, highlights its card and reveals the confirm button.
     /// </summary>
     public void SelectHero(int index)
     {
@@ -100,10 +108,12 @@ public class HeroSelectManager : MonoBehaviour
             }
         }
 
-        if (entryAudioSource != null && hero.entryClip != null)
+        if (voiceAudioSource != null)
         {
-            entryAudioSource.Stop();
-            entryAudioSource.PlayOneShot(hero.entryClip);
+            // Restart cleanly: re-selecting cuts the previous bark instead of layering it.
+            voiceAudioSource.Stop();
+            voiceAudioSource.clip = hero.selectClip;
+            if (hero.selectClip != null) voiceAudioSource.Play();
         }
 
         ShowPreview(hero);
@@ -114,7 +124,7 @@ public class HeroSelectManager : MonoBehaviour
         }
     }
 
-    /// <summary>Stores the selected hero in GameSession and loads the match scene.</summary>
+    /// <summary>Stores the selected hero in GameSession, plays its intro and loads the match scene.</summary>
     public void ConfirmSelection()
     {
         HeroDefinitionSO hero = SelectedHero;
@@ -130,16 +140,54 @@ public class HeroSelectManager : MonoBehaviour
             Debug.LogWarning("HeroSelectManager: no GameSession in the scene; selected hero will not persist.");
         }
 
-        StartCoroutine(FadeAndLoad());
+        StartCoroutine(ConfirmRoutine(hero));
     }
 
-    private IEnumerator FadeAndLoad()
+    private IEnumerator ConfirmRoutine(HeroDefinitionSO hero)
     {
+        bool hasIntro = introPlayer != null && IntroSequencePlayer.HasLines(hero.introLines);
+
+        if (!hasIntro)
+        {
+            // Straight to the match: fade the voice together with the screen.
+            StartCoroutine(FadeOutVoice(fader != null ? fader.DefaultDuration : voiceFadeOutDuration));
+        }
+
         if (fader != null)
         {
             yield return fader.FadeOut();
         }
+
+        if (hasIntro)
+        {
+            // Screen is black: freeze the preview. The select voice line is left to finish on its own.
+            if (currentPreview != null)
+            {
+                TurntableRotator rotator = currentPreview.GetComponent<TurntableRotator>();
+                if (rotator != null) rotator.enabled = false;
+            }
+
+            yield return introPlayer.Play(hero.introLines);
+            yield return FadeOutVoice(voiceFadeOutDuration);
+        }
+
         SceneManager.LoadScene(nextSceneName);
+    }
+
+    private IEnumerator FadeOutVoice(float duration)
+    {
+        if (voiceAudioSource == null || !voiceAudioSource.isPlaying) yield break;
+
+        float startVolume = voiceAudioSource.volume;
+        float t = 0f;
+        while (t < duration && voiceAudioSource.isPlaying)
+        {
+            t += Time.unscaledDeltaTime;
+            voiceAudioSource.volume = Mathf.Lerp(startVolume, 0f, Mathf.Clamp01(t / duration));
+            yield return null;
+        }
+        voiceAudioSource.Stop();
+        voiceAudioSource.volume = startVolume;
     }
 
     private void ShowPreview(HeroDefinitionSO hero)
