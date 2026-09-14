@@ -17,13 +17,13 @@ public class HeroDefinitionSO : ScriptableObject
     [Tooltip("Voice line played when the player picks this hero on the select screen.")]
     public AudioClip selectClip;
 
-    [Tooltip("Voice line played when the player enters the match.")]
+    [Tooltip("Voice line played together with the story intro (or, for heroes without intro lines, when the match starts).")]
     public AudioClip entryClip;
 
     [Tooltip("3D model shown on the hero-select pedestal.")]
     public GameObject previewModel;
 
-    [Tooltip("Story lines shown one by one on a black screen after confirming this hero.")]
+    [Tooltip("Story lines shown together (one per line) on a black screen after confirming this hero, while entryClip plays.")]
     [TextArea]
     public string[] introLines;
 }

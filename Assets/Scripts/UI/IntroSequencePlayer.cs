@@ -2,46 +2,46 @@ using System.Collections;
 using TMPro;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.Serialization;
 
 /// <summary>
-/// Shows story lines one at a time on a black screen (e.g. after confirming a hero).
+/// Story intro shown on the black screen after confirming a hero.
+/// All lines appear together as one centered block while the hero's voice line plays. Input is refused
+/// until the voice line has finished; then a pulsing hint appears and a fresh trigger press (or
+/// Space/Enter) fades the text out and ends the sequence.
 /// Lives on a world-space canvas parented to the (XR) camera ~2 m in front of the eyes, with a sorting
 /// order above the ScreenFader so the text draws on top of the black fade.
-/// Each line fades in, holds (longer for longer lines) and fades out. Either controller trigger or
-/// Space/Enter skips to the next line; a short cooldown keeps one press from skipping several lines,
-/// and only fresh presses count, so the trigger press that clicked CONFIRMAR can't skip line 1.
-/// Usage from another coroutine: <c>yield return introPlayer.Play(lines);</c>
+/// Usage from another coroutine: <c>yield return introPlayer.Play(lines, voiceClip);</c>
 /// </summary>
 [RequireComponent(typeof(Canvas))]
 [RequireComponent(typeof(CanvasGroup))]
 public class IntroSequencePlayer : MonoBehaviour
 {
+    public enum Phase { Idle, Speaking, WaitingForContinue, Finishing }
+
     [Header("References")]
-    [Tooltip("Text that shows the current story line. Faded through its own CanvasGroup.")]
-    [SerializeField] private TMP_Text lineText;
+    [Tooltip("Text block that shows all story lines (one sentence per line).")]
+    [FormerlySerializedAs("lineText")]
+    [SerializeField] private TMP_Text storyText;
+    [Tooltip("'Press the trigger to continue' hint, shown once the voice line has finished. Should have an AlphaPulse.")]
+    [SerializeField] private TMP_Text hintText;
+    [Tooltip("2D source for the hero voice line. Created automatically if empty.")]
+    [SerializeField] private AudioSource voiceSource;
 
     [Header("Timing (seconds, unscaled)")]
-    [SerializeField] private float fadeInDuration = 0.6f;
-    [SerializeField] private float fadeOutDuration = 0.6f;
-    [Tooltip("Fade-out used when the player skips a line.")]
-    [SerializeField] private float skipFadeOutDuration = 0.15f;
-    [SerializeField] private float baseHold = 2.5f;
-    [Tooltip("Extra hold per character, so longer lines stay up longer.")]
-    [SerializeField] private float holdPerCharacter = 0.04f;
-    [Tooltip("Extra hold for the final line.")]
-    [SerializeField] private float lastLineExtraHold = 1f;
-    [Tooltip("Short black pause before each line.")]
-    [SerializeField] private float gapBetweenLines = 0.25f;
+    [SerializeField] private float textFadeInDuration = 0.8f;
+    [SerializeField] private float hintFadeInDuration = 0.4f;
+    [SerializeField] private float textFadeOutDuration = 0.6f;
+    [Tooltip("If there is no voice clip (or it can't play), wait this long before offering to continue.")]
+    [SerializeField] private float minReadTimeWithoutVoice = 3f;
+    [Tooltip("After the hint starts appearing, ignore input for this long.")]
+    [SerializeField] private float continueInputDelay = 0.25f;
 
     [Header("Input")]
     [Tooltip("e.g. XRI Left Interaction/Activate (trigger).")]
     [SerializeField] private InputActionReference leftTriggerAction;
     [Tooltip("e.g. XRI Right Interaction/Activate (trigger).")]
     [SerializeField] private InputActionReference rightTriggerAction;
-    [Tooltip("Ignore input for this long after the sequence starts.")]
-    [SerializeField] private float initialInputDelay = 0.4f;
-    [Tooltip("Ignore input for this long after each skip (one press = one line).")]
-    [SerializeField] private float inputCooldown = 0.3f;
 
     [Header("Look")]
     [Tooltip("Phrases highlighted in the accent color wherever they appear (TMP rich text).")]
@@ -54,14 +54,17 @@ public class IntroSequencePlayer : MonoBehaviour
 
     private Canvas canvas;
     private CanvasGroup group;
-    private CanvasGroup lineGroup;
-    private float inputBlockedUntil;
-    private bool skipRequested;
+    private CanvasGroup storyGroup;
+    private CanvasGroup hintGroup;
+    private float continueAllowedAt;
+    private bool continueRequested;
 
-    public bool IsPlaying { get; private set; }
+    public Phase CurrentPhase { get; private set; } = Phase.Idle;
+    public bool IsPlaying => CurrentPhase != Phase.Idle;
+    public AudioSource VoiceSource => voiceSource;
 
-    /// <summary>Index of the line currently shown (-1 when idle). Useful for tests/analytics.</summary>
-    public int CurrentLineIndex { get; private set; } = -1;
+    /// <summary>True once the voice line has finished and the player may continue.</summary>
+    public bool CanContinue => CurrentPhase == Phase.WaitingForContinue && Time.unscaledTime >= continueAllowedAt;
 
     private void Awake()
     {
@@ -70,13 +73,17 @@ public class IntroSequencePlayer : MonoBehaviour
         group.interactable = false;
         group.blocksRaycasts = false;
 
-        if (lineText != null)
+        storyGroup = GetOrAddGroup(storyText);
+        hintGroup = GetOrAddGroup(hintText);
+
+        if (voiceSource == null)
         {
-            lineGroup = lineText.GetComponent<CanvasGroup>();
-            if (lineGroup == null) lineGroup = lineText.gameObject.AddComponent<CanvasGroup>();
-            lineGroup.interactable = false;
-            lineGroup.blocksRaycasts = false;
+            voiceSource = GetComponent<AudioSource>();
+            if (voiceSource == null) voiceSource = gameObject.AddComponent<AudioSource>();
         }
+        voiceSource.playOnAwake = false;
+        voiceSource.loop = false;
+        voiceSource.spatialBlend = 0f;
 
         HideImmediate();
     }
@@ -85,6 +92,16 @@ public class IntroSequencePlayer : MonoBehaviour
     {
         EnableAction(leftTriggerAction);
         EnableAction(rightTriggerAction);
+    }
+
+    private static CanvasGroup GetOrAddGroup(Component target)
+    {
+        if (target == null) return null;
+        CanvasGroup g = target.GetComponent<CanvasGroup>();
+        if (g == null) g = target.gameObject.AddComponent<CanvasGroup>();
+        g.interactable = false;
+        g.blocksRaycasts = false;
+        return g;
     }
 
     private static void EnableAction(InputActionReference reference)
@@ -96,104 +113,143 @@ public class IntroSequencePlayer : MonoBehaviour
     {
         group.alpha = 0f;
         canvas.enabled = false;
-        if (lineGroup != null) lineGroup.alpha = 0f;
+        if (storyGroup != null) storyGroup.alpha = 0f;
+        if (hintGroup != null) hintGroup.alpha = 0f;
     }
 
     /// <summary>True if the array has at least one non-empty line.</summary>
-    public static bool HasLines(string[] lines) => LastNonEmptyIndex(lines) >= 0;
+    public static bool HasLines(string[] lines)
+    {
+        if (lines == null) return false;
+        foreach (string line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line)) return true;
+        }
+        return false;
+    }
 
     /// <summary>
-    /// Advances to the next line (same as pressing a trigger). Respects the input cooldown.
+    /// Same as pressing a trigger. Only accepted once the voice line has finished and the hint is up.
     /// Returns true if the request was accepted.
     /// </summary>
-    public bool Skip()
+    public bool RequestContinue()
     {
-        if (!IsPlaying || skipRequested || Time.unscaledTime < inputBlockedUntil) return false;
-        skipRequested = true;
-        inputBlockedUntil = Time.unscaledTime + inputCooldown;
+        if (!CanContinue || continueRequested) return false;
+        continueRequested = true;
         return true;
     }
 
-    /// <summary>Plays the lines one after another. Yield on it from a coroutine.</summary>
-    public IEnumerator Play(string[] lines)
+    /// <summary>
+    /// Shows all lines at once, plays <paramref name="voice"/> at the same moment and waits for it to finish,
+    /// then for the player to continue. Yield on it from a coroutine.
+    /// </summary>
+    public IEnumerator Play(string[] lines, AudioClip voice)
     {
-        int lastIndex = LastNonEmptyIndex(lines);
-        if (lastIndex < 0 || lineText == null) yield break;
+        if (!HasLines(lines) || storyText == null) yield break;
 
         Camera cam = isolateCamera ? GetComponentInParent<Camera>() : null;
         int previousMask = cam != null ? cam.cullingMask : 0;
 
-        IsPlaying = true;
-        skipRequested = false;
-        inputBlockedUntil = Time.unscaledTime + initialInputDelay;
-        lineGroup.alpha = 0f;
-        group.alpha = 0f;
+        continueRequested = false;
+        storyText.text = BuildText(lines);
+        storyGroup.alpha = 0f;
+        if (hintGroup != null) hintGroup.alpha = 0f;
+        group.alpha = 1f;
         canvas.enabled = true;
         if (cam != null) cam.cullingMask = introCullingMask;
 
         try
         {
-            // Hint fades in gently with the overlay.
-            yield return FadeGroup(group, 1f, 0.3f);
-
-            for (int i = 0; i <= lastIndex; i++)
+            // Text and voice start together.
+            CurrentPhase = Phase.Speaking;
+            bool voiceStarted = false;
+            if (voice != null && voiceSource != null)
             {
-                string line = lines[i] != null ? lines[i].Trim() : string.Empty;
-                if (line.Length == 0) continue;
-
-                CurrentLineIndex = i;
-                lineText.text = ApplyAccents(line);
-                lineGroup.alpha = 0f;
-                skipRequested = false;
-
-                yield return Wait(gapBetweenLines);
-
-                float hold = baseHold + holdPerCharacter * line.Length + (i == lastIndex ? lastLineExtraHold : 0f);
-
-                // Fade in -> hold. A skip request ends either phase immediately.
-                float t = 0f;
-                while (!skipRequested && t < fadeInDuration)
-                {
-                    t += Time.unscaledDeltaTime;
-                    lineGroup.alpha = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(t / fadeInDuration));
-                    yield return null;
-                    PollInput();
-                }
-
-                t = 0f;
-                while (!skipRequested && t < hold)
-                {
-                    t += Time.unscaledDeltaTime;
-                    yield return null;
-                    PollInput();
-                }
-
-                // Fade out; switches to the quick rate if the player skips mid-fade.
-                while (lineGroup.alpha > 0f)
-                {
-                    float duration = skipRequested ? skipFadeOutDuration : fadeOutDuration;
-                    lineGroup.alpha = Mathf.MoveTowards(lineGroup.alpha, 0f,
-                        Time.unscaledDeltaTime / Mathf.Max(0.01f, duration));
-                    yield return null;
-                    PollInput();
-                }
+                voiceSource.Stop();
+                voiceSource.clip = voice;
+                voiceSource.time = 0f;
+                voiceSource.Play();
+                voiceStarted = true;
             }
 
-            yield return FadeGroup(group, 0f, 0.3f);
+            StartCoroutine(FadeGroup(storyGroup, 1f, textFadeInDuration));
+            float speakStart = Time.unscaledTime;
+
+            yield return WaitForVoice(voiceStarted ? voice : null);
+            Debug.Log($"IntroSequencePlayer: voice line finished after {Time.unscaledTime - speakStart:F2} s " +
+                      $"(clip length {(voice != null ? voice.length : 0f):F2} s); waiting for the player to continue.");
+
+            // Make sure the text is fully visible before offering to continue.
+            while (storyGroup.alpha < 1f) yield return null;
+
+            CurrentPhase = Phase.WaitingForContinue;
+            continueAllowedAt = Time.unscaledTime + continueInputDelay;
+            if (hintGroup != null) StartCoroutine(FadeGroup(hintGroup, 1f, hintFadeInDuration));
+
+            while (!continueRequested)
+            {
+                yield return null;
+                PollInput();
+            }
+
+            CurrentPhase = Phase.Finishing;
+            yield return FadeGroup(group, 0f, textFadeOutDuration);
         }
         finally
         {
             if (cam != null) cam.cullingMask = previousMask;
-            IsPlaying = false;
-            skipRequested = false;
-            CurrentLineIndex = -1;
+            CurrentPhase = Phase.Idle;
+            continueRequested = false;
             HideImmediate();
+        }
+    }
+
+    /// <summary>
+    /// Waits until the voice line has played to the end. A source paused mid-clip (isPlaying false but
+    /// playback position inside the clip) keeps waiting. If the clip never starts playing (no audio
+    /// device, audio disabled), falls back to waiting the clip length in real time.
+    /// </summary>
+    private IEnumerator WaitForVoice(AudioClip voice)
+    {
+        if (voice == null)
+        {
+            yield return WaitRealtime(minReadTimeWithoutVoice);
+            yield break;
+        }
+
+        // Give the audio system a couple of frames to start the source.
+        float startTime = Time.unscaledTime;
+        bool everPlayed = false;
+        while (Time.unscaledTime - startTime < 0.25f)
+        {
+            if (voiceSource.isPlaying) { everPlayed = true; break; }
+            yield return null;
+        }
+
+        if (!everPlayed)
+        {
+            Debug.LogWarning("IntroSequencePlayer: voice line did not start playing; waiting its length instead.");
+            yield return WaitRealtime(Mathf.Max(minReadTimeWithoutVoice, voice.length - (Time.unscaledTime - startTime)));
+            yield break;
+        }
+
+        float endMargin = 0.05f;
+        while (true)
+        {
+            if (voiceSource.clip != voice) break; // someone swapped the clip: stop waiting
+            if (!voiceSource.isPlaying)
+            {
+                float pos = voiceSource.time;
+                bool pausedMidClip = pos > 0f && pos < voice.length - endMargin;
+                if (!pausedMidClip) break; // finished (Unity rewinds to 0 at the end) or stopped
+            }
+            yield return null;
         }
     }
 
     private void PollInput()
     {
-        if (skipRequested || Time.unscaledTime < inputBlockedUntil) return;
+        if (!CanContinue || continueRequested) return;
 
         bool pressed = WasPressed(leftTriggerAction) || WasPressed(rightTriggerAction);
         Keyboard keyboard = Keyboard.current;
@@ -205,12 +261,12 @@ public class IntroSequencePlayer : MonoBehaviour
             pressed = true;
         }
 
-        if (pressed) Skip();
+        if (pressed) RequestContinue();
     }
 
     private static bool WasPressed(InputActionReference reference)
     {
-        // WasPressedThisFrame only fires on a fresh press, so a trigger still held from the CONFIRMAR click is ignored.
+        // WasPressedThisFrame only fires on a fresh press, so a trigger held since before the hint is ignored.
         return reference != null && reference.action != null && reference.action.WasPressedThisFrame();
     }
 
@@ -221,20 +277,32 @@ public class IntroSequencePlayer : MonoBehaviour
         while (t < duration)
         {
             t += Time.unscaledDeltaTime;
-            target.alpha = Mathf.Lerp(from, to, Mathf.Clamp01(t / duration));
+            target.alpha = Mathf.SmoothStep(from, to, Mathf.Clamp01(t / duration));
             yield return null;
         }
         target.alpha = to;
     }
 
-    private IEnumerator Wait(float seconds)
+    private static IEnumerator WaitRealtime(float seconds)
     {
         float t = 0f;
         while (t < seconds)
         {
             t += Time.unscaledDeltaTime;
-            yield return null; // no input here: a press in the gap must not skip a line the player hasn't seen
+            yield return null;
         }
+    }
+
+    private string BuildText(string[] lines)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (string raw in lines)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            if (sb.Length > 0) sb.Append('\n');
+            sb.Append(ApplyAccents(raw.Trim()));
+        }
+        return sb.ToString();
     }
 
     private string ApplyAccents(string line)
@@ -247,15 +315,5 @@ public class IntroSequencePlayer : MonoBehaviour
             line = line.Replace(phrase, $"<color=#{hex}>{phrase}</color>");
         }
         return line;
-    }
-
-    private static int LastNonEmptyIndex(string[] lines)
-    {
-        if (lines == null) return -1;
-        for (int i = lines.Length - 1; i >= 0; i--)
-        {
-            if (!string.IsNullOrWhiteSpace(lines[i])) return i;
-        }
-        return -1;
     }
 }

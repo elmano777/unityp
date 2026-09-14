@@ -134,6 +134,7 @@ public class HeroSelectManager : MonoBehaviour
         if (GameSession.Instance != null)
         {
             GameSession.Instance.SelectedHero = hero;
+            GameSession.Instance.EntryLinePlayed = false;
         }
         else
         {
@@ -145,38 +146,52 @@ public class HeroSelectManager : MonoBehaviour
 
     private IEnumerator ConfirmRoutine(HeroDefinitionSO hero)
     {
+        // Heroes without intro lines go straight to the match; their entry line then plays in the match
+        // scene (HeroEntryAnnouncer), because GameSession.EntryLinePlayed stays false.
         bool hasIntro = introPlayer != null && IntroSequencePlayer.HasLines(hero.introLines);
 
-        if (!hasIntro)
-        {
-            // Straight to the match: fade the voice together with the screen.
-            StartCoroutine(FadeOutVoice(fader != null ? fader.DefaultDuration : voiceFadeOutDuration));
-        }
+        // The select bark fades out so that it is silent exactly when the screen is black
+        // (never overlapping the entry line that starts with the intro).
+        float fadeDuration = fader != null ? fader.DefaultDuration : 0f;
+        float voiceFade = Mathf.Min(voiceFadeOutDuration, Mathf.Max(fadeDuration, 0.01f));
+        Coroutine voiceRoutine = StartCoroutine(FadeOutVoice(voiceFade, Mathf.Max(0f, fadeDuration - voiceFade)));
 
         if (fader != null)
         {
             yield return fader.FadeOut();
         }
+        yield return voiceRoutine;
+
+        // Screen is black: freeze the preview.
+        if (currentPreview != null)
+        {
+            TurntableRotator rotator = currentPreview.GetComponent<TurntableRotator>();
+            if (rotator != null) rotator.enabled = false;
+        }
 
         if (hasIntro)
         {
-            // Screen is black: freeze the preview. The select voice line is left to finish on its own.
-            if (currentPreview != null)
+            if (GameSession.Instance != null && hero.entryClip != null)
             {
-                TurntableRotator rotator = currentPreview.GetComponent<TurntableRotator>();
-                if (rotator != null) rotator.enabled = false;
+                GameSession.Instance.EntryLinePlayed = true;
             }
-
-            yield return introPlayer.Play(hero.introLines);
-            yield return FadeOutVoice(voiceFadeOutDuration);
+            yield return introPlayer.Play(hero.introLines, hero.entryClip);
         }
 
         SceneManager.LoadScene(nextSceneName);
     }
 
-    private IEnumerator FadeOutVoice(float duration)
+    private IEnumerator FadeOutVoice(float duration, float delay = 0f)
     {
         if (voiceAudioSource == null || !voiceAudioSource.isPlaying) yield break;
+
+        float wait = 0f;
+        while (wait < delay && voiceAudioSource.isPlaying)
+        {
+            wait += Time.unscaledDeltaTime;
+            yield return null;
+        }
+        if (!voiceAudioSource.isPlaying) yield break;
 
         float startVolume = voiceAudioSource.volume;
         float t = 0f;
