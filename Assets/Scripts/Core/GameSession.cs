@@ -17,6 +17,25 @@ public class GameSession : MonoBehaviour
     /// </summary>
     public bool EntryLinePlayed { get; set; }
 
+    /// <summary>
+    /// Which menu button led into this match: "online" for the ritual, "mission" for the guided
+    /// practice. Recorded on every <see cref="MatchStats"/> so the Adoption metric can tell the
+    /// two entry points apart.
+    /// </summary>
+    public string MatchSource { get; set; } = "unknown";
+
+    /// <summary>
+    /// How many rituals have finished since the app launched. Drives the Retention metric, which
+    /// asks whether a player starts a second match rather than whether they ever played one.
+    /// </summary>
+    public int MatchesThisSession { get; set; }
+
+    /// <summary>
+    /// True while the player is inside "Mi misión", so the match scene can skip the rival, the
+    /// time cap and the win condition, and the stats record can be tagged as practice.
+    /// </summary>
+    public bool IsPracticeRun { get; set; }
+
     private void Awake()
     {
         if (Instance != null && Instance != this)
